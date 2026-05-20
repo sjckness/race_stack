@@ -1,0 +1,84 @@
+# ForzaETH Race Stack — Jetson (ARM64) compose.
+#
+# Use alongside (NOT in place of) docker-compose.yaml, which is the x86
+# developer setup. Bring this stack up with:
+#
+#   docker compose -f docker-compose.jetson.yaml build
+#   docker compose -f docker-compose.jetson.yaml up -d
+#   docker compose -f docker-compose.jetson.yaml exec racestack bash
+#
+# See README_JETSON.md for prerequisites (nvidia-container-toolkit etc.).
+
+services:
+  racestack:
+    image: forzaeth_racestack_ros2:jetson
+    container_name: forzaeth_racestack_jetson
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile.jetson
+      # Pin arch so `docker buildx` on x86 cross-builds for the Jetson and an
+      # accidental native amd64 build on a dev box errors out.
+      platforms:
+        - linux/arm64
+      args:
+        # Default to a `ros` user; override with USER/UID/GID in .env.jetson
+        # if you want host-uid-matched volume ownership.
+        USERNAME: ${USERNAME:-ros}
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+        ROS_DISTRO: jazzy
+
+    # GPU passthrough on Jetson is handled by nvidia-container-toolkit.
+    # `runtime: nvidia` is what works on Jetson today; if you prefer the newer
+    # Compose `deploy.resources.reservations.devices` syntax, you can swap to
+    # it once your nvidia-container-toolkit version supports it on aarch64.
+    runtime: nvidia
+
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+      QT_X11_NO_MITSHM: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      ROS_DOMAIN_ID: "48"
+      # Avoid RMW shared-memory issues on aarch64 + host networking; CycloneDDS
+      # tends to behave better than Fast DDS in that combo. Override to
+      # rmw_fastrtps_cpp if you specifically want Fast DDS.
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+
+    # ROS 2 discovery is much simpler on host net for a single-Jetson setup;
+    # the f1tenth NUC reference uses the same. Remove and switch to a user
+    # network if you need isolation.
+    network_mode: host
+
+    # Required for /dev/input/js0, /dev/ttyACM* (VESC), /dev/ttyUSB* (LiDAR)
+    privileged: true
+
+    volumes:
+      # GUI forwarding (only used when DISPLAY is set on the Jetson desktop)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-/dev/null}:/home/${USERNAME:-ros}/.Xauthority:rw
+      # Hardware passthrough
+      - /dev:/dev
+      # Persistent ros bags / maps / logs outside the container. Created on
+      # first up; safe to delete.
+      - ./.jetson_data/bags:/home/${USERNAME:-ros}/ws/bags
+      - ./.jetson_data/maps:/home/${USERNAME:-ros}/ws/src/race_stack/stack_master/maps_user
+
+    # Keep stdin/tty so `docker compose up` keeps a usable bash; for headless
+    # daemon use replace CMD via `command:` (e.g. a ros2 launch line).
+    stdin_open: true
+    tty: true
+
+    # rosbridge_server is the only port the stack exports by default.
+    ports:
+      - "9090:9090"
+
+    # Health check verifies the ROS overlay is sourceable inside the container.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 pkg list >/dev/null'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    restart: unless-stopped

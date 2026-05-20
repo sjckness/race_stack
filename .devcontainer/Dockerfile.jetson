@@ -1,0 +1,208 @@
+# syntax=docker/dockerfile:1.7
+#
+# ForzaETH Race Stack — Jetson (ARM64 / aarch64) image
+# Target: NVIDIA Jetson Thor, JetPack 7, Ubuntu 24.04.3 LTS, ROS 2 Jazzy.
+#
+# Base choice — `ubuntu:24.04` over `nvcr.io/nvidia/l4t-jetpack:r36.x`:
+#   * The race_stack has **no CUDA, TensorRT, cuDNN or PyTorch code** (audited
+#     in Phase 1) — there is nothing in the stack that needs the JetPack CUDA
+#     SDK to be baked into the image.
+#   * ROS 2 Jazzy requires Ubuntu 24.04 (Noble); `l4t-jetpack:r36.*` is JetPack
+#     6 / Ubuntu 22.04 and has no Jazzy apt feed. The matching JetPack-7 L4T
+#     image is not yet broadly published as of writing.
+#   * GPU access for rviz2/pyglet (OpenGL) is provided by the host's
+#     nvidia-container-toolkit at run time via `--runtime nvidia` plus
+#     `NVIDIA_DRIVER_CAPABILITIES=all`, regardless of base image. See
+#     README_JETSON.md.
+#
+# Architecture is pinned to linux/arm64 so that `docker buildx` cross-builds
+# from x86 produce the right image, and so an accidental amd64 build on the
+# Jetson fails loudly instead of silently producing a useless image.
+
+ARG ROS_DISTRO=jazzy
+
+# =============================================================================
+# Stage 1 — builder: full ROS dev + colcon build of the workspace
+# =============================================================================
+FROM --platform=linux/arm64 ubuntu:24.04 AS builder
+
+ARG ROS_DISTRO
+ARG DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 ROS_DISTRO=${ROS_DISTRO}
+
+# Locale + base prereqs for adding the ROS 2 apt repo
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        locales curl gnupg lsb-release ca-certificates \
+        software-properties-common apt-utils sudo wget jq \
+    && locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8 \
+    && add-apt-repository -y universe \
+    && rm -rf /var/lib/apt/lists/*
+
+# Official ROS 2 apt repo — arm64 is a Tier-1 platform for Jazzy
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+        -o /usr/share/keyrings/ros-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+        > /etc/apt/sources.list.d/ros2.list
+
+# Dev toolchain + ROS 2 desktop + colcon/rosdep/vcstool (via ros-dev-tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git pkg-config \
+        python3-pip python3-dev python3-venv \
+        python3-colcon-common-extensions python3-colcon-clean \
+        ros-dev-tools \
+        ros-${ROS_DISTRO}-desktop \
+    && rm -rf /var/lib/apt/lists/*
+
+# Project apt deps (mirrors .install_utils/linux_req/linux_req.txt). The same
+# list works on arm64 — every ros-jazzy-* package in it is published for arm64.
+COPY .install_utils/linux_req/ /tmp/.install_utils/
+RUN apt-get update && \
+    xargs apt-get install -y --no-install-recommends < /tmp/.install_utils/linux_req.txt \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps — match the x86 Dockerfile sequence exactly:
+#   1) remove apt python3-kiwisolver so it doesn't pin matplotlib/numpy
+#   2) pip install the project python_req.txt
+#   3) install quadprog (kept separate per upstream tph note)
+#   4) reinstall ros-jazzy-desktop so apt doesn't mark it auto-removable after
+#      kiwisolver disappeared.
+COPY .install_utils/python_req.txt /tmp/.install_utils/python_req.txt
+RUN apt-get update && \
+    apt-get remove -y python3-kiwisolver || true && \
+    pip3 install --break-system-packages --no-cache-dir \
+        -r /tmp/.install_utils/python_req.txt && \
+    pip3 install --break-system-packages --no-cache-dir quadprog~=0.1.11 && \
+    apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-desktop && \
+    rm -rf /var/lib/apt/lists/*
+
+# Initialise rosdep
+RUN rosdep init || true && rosdep update --rosdistro=${ROS_DISTRO}
+
+# Copy the workspace source (submodules must be checked out on the host first)
+WORKDIR /ws
+COPY . /ws/src/race_stack
+
+# rosdep over the source tree.
+#   * `python-transforms3d-pip` is skipped because we install transforms3d
+#     through apt (ros-jazzy-tf-transformations) / pip already, and the rosdep
+#     key resolves to a pip name that fails under --break-system-packages on
+#     Noble. Same key is silently ignored on the existing x86 setup.
+#   * `catkin` / `message_generation` keys (ROS 1) appear in the f1tenth_gym
+#     submodule for legacy reasons; they are not real build deps for Jazzy.
+RUN apt-get update && \
+    cd /ws && rosdep install --from-paths src --ignore-src -y \
+        --rosdistro ${ROS_DISTRO} \
+        --skip-keys "python-transforms3d-pip catkin message_generation" \
+    && rm -rf /var/lib/apt/lists/*
+
+# Editable installs for the two Python-only "sub-packages" pulled in by ROS
+# launches at runtime. Both are pure-Python with aarch64-friendly deps.
+RUN pip3 install --break-system-packages --no-cache-dir \
+        -e /ws/src/race_stack/base_system/f110_simulator/f1tenth_gym && \
+    pip3 install --break-system-packages --no-cache-dir \
+        -e /ws/src/race_stack/planner/global_planner/global_planner/global_racetrajectory_optimization
+
+# Build the workspace with symlink-install (per task spec).
+# `--symlink-install` means /ws/install symlinks back to files under /ws/src,
+# so /ws/src must be carried forward into the runtime stage too.
+RUN . /opt/ros/${ROS_DISTRO}/setup.sh && \
+    cd /ws && \
+    colcon build --symlink-install \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release \
+        --event-handlers console_direct+
+
+# =============================================================================
+# Stage 2 — runtime: same base, no compilers, copy the built workspace
+# =============================================================================
+FROM --platform=linux/arm64 ubuntu:24.04 AS runtime
+
+ARG ROS_DISTRO
+ARG DEBIAN_FRONTEND=noninteractive
+ARG USERNAME=ros
+ARG UID=1000
+ARG GID=1000
+
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    ROS_DISTRO=${ROS_DISTRO} \
+    USERNAME=${USERNAME} \
+    ROS_DOMAIN_ID=48
+
+# Jetson nvidia-container-toolkit hints: ask for all driver capabilities so
+# rviz2 (OGRE/OpenGL) and the f110_gym viewer (pyglet/OpenGL) work via
+# `--runtime nvidia`. Compute caps cost nothing if no CUDA code runs.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=all
+
+# Same locale + ROS apt repo setup as the builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        locales curl gnupg lsb-release ca-certificates \
+        software-properties-common apt-utils sudo wget jq \
+        python3-pip python3-dev \
+    && locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8 \
+    && add-apt-repository -y universe \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+        -o /usr/share/keyrings/ros-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+        > /etc/apt/sources.list.d/ros2.list
+
+# ROS desktop (needed for rviz2) + project apt deps. No build-essential here.
+COPY .install_utils/linux_req/ /tmp/.install_utils/
+COPY .install_utils/python_req.txt /tmp/.install_utils/python_req.txt
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-${ROS_DISTRO}-desktop && \
+    xargs apt-get install -y --no-install-recommends < /tmp/.install_utils/linux_req.txt && \
+    apt-get remove -y python3-kiwisolver || true && \
+    pip3 install --break-system-packages --no-cache-dir \
+        -r /tmp/.install_utils/python_req.txt && \
+    pip3 install --break-system-packages --no-cache-dir quadprog~=0.1.11 && \
+    apt-get install -y --no-install-recommends ros-${ROS_DISTRO}-desktop && \
+    rm -rf /var/lib/apt/lists/* /tmp/.install_utils
+
+# Non-root user. UID/GID default to 1000/1000 (typical `nvidia` user on a
+# fresh JetPack install) but can be overridden at build time so file
+# ownership on bind-mounted volumes matches the host user.
+RUN groupadd --gid ${GID} ${USERNAME} && \
+    useradd  --uid ${UID} --gid ${GID} -m -s /bin/bash ${USERNAME} && \
+    echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} && \
+    chmod 0440 /etc/sudoers.d/${USERNAME}
+
+# Carry the built workspace + sources across stages.
+#   - install/ holds the colcon outputs and overlay setup.bash
+#   - src/     is required because we built with --symlink-install
+WORKDIR /home/${USERNAME}/ws
+COPY --from=builder --chown=${UID}:${GID} /ws/src     /home/${USERNAME}/ws/src
+COPY --from=builder --chown=${UID}:${GID} /ws/install /home/${USERNAME}/ws/install
+
+# Re-do the editable pip installs against the runtime source paths so the
+# `f110_gym` / `global_racetrajectory_optimization` egg-links point to the
+# right location inside this image.
+USER ${USERNAME}
+RUN pip3 install --break-system-packages --no-cache-dir --user \
+        -e /home/${USERNAME}/ws/src/race_stack/base_system/f110_simulator/f1tenth_gym && \
+    pip3 install --break-system-packages --no-cache-dir --user \
+        -e /home/${USERNAME}/ws/src/race_stack/planner/global_planner/global_planner/global_racetrajectory_optimization
+
+# Match the existing project bashrc conventions (auto-source ROS + overlay)
+RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash"                    >> /home/${USERNAME}/.bashrc && \
+    echo "source /home/${USERNAME}/ws/install/setup.bash"              >> /home/${USERNAME}/.bashrc && \
+    echo "export ROS_DOMAIN_ID=48"                                     >> /home/${USERNAME}/.bashrc && \
+    echo "export USERNAME=${USERNAME}"                                 >> /home/${USERNAME}/.bashrc && \
+    echo "alias sauce='source /opt/ros/\${ROS_DISTRO}/setup.bash && source /home/\${USERNAME}/ws/install/setup.bash'" \
+                                                                       >> /home/${USERNAME}/.bashrc
+
+USER root
+COPY .devcontainer/ros_entrypoint_jetson.sh /ros_entrypoint.sh
+RUN chmod +x /ros_entrypoint.sh
+
+# Ports used by the stack:
+#   9090 — rosbridge_server websocket (base_system/f1tenth_stack depends on it)
+# foxglove-bridge / noVNC are not built-in; document run-time opt-ins in README.
+EXPOSE 9090
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}/ws
+
+ENTRYPOINT ["/ros_entrypoint.sh"]
+CMD ["/bin/bash"]
